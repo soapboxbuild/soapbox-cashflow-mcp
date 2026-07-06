@@ -16,6 +16,11 @@ function runScript(script: string, inputJson: unknown): unknown {
   return JSON.parse(out)
 }
 
+// A StreamableHTTP server in stateless mode (sessionIdGenerator: undefined) can only connect a
+// given server instance to ONE transport. Reusing a single shared server across requests threw
+// "Already connected to a transport" on the 2nd request (→ 502). Build a fresh server + transport
+// per request instead (the SDK's stateless pattern).
+function createServer() {
 const server = new McpServer({ name: 'soapbox-cashflow', version: '1.0.0' })
 
 server.tool(
@@ -175,12 +180,17 @@ server.tool(
   }
 )
 
+  return server
+}
+
 const app = express()
 app.use(express.json())
 app.get('/health', (_req, res) => res.json({ status: 'ok', service: 'soapbox-cashflow-mcp' }))
 
 app.all('/mcp', async (req, res) => {
+  const server = createServer()
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined })
+  res.on('close', () => { try { transport.close() } catch {} ; try { server.close() } catch {} })
   await server.connect(transport)
   await transport.handleRequest(req, res, req.body)
 })
