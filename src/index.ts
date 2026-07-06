@@ -3,6 +3,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { z } from 'zod'
 import { execFileSync } from 'child_process'
+import { computePlanEconomics } from './economics.js'
 
 const SCRIPTS_DIR = process.env.SCRIPTS_DIR ?? '/home/claude/soapbox-agent/scripts'
 
@@ -179,6 +180,37 @@ server.tool(
     return { content: [{ type: 'text' as const, text: JSON.stringify({ summary: { total: assets.length, passed, failed: assets.length - passed }, results }, null, 2) }] }
   }
 )
+
+  // ── Deterministic decarb plan value-bridge + incremental IRR (native TS, no python) ──
+  // The report engine for decarbonization plans. Supply per-year OWNER-SHARE line items
+  // (which trace to Audette measures); this returns the full derived money-math so the
+  // LLM never hand-computes IRR, capitalization, PV, or the cashflow schedule. Calibrated
+  // against verified reports (see economics.test.ts).
+  server.tool(
+    'compute_plan_economics',
+    'Compute a decarbonization plan\'s value bridge and incremental IRR deterministically from per-year owner-share cash flows. Use this for EVERY decarb plan instead of hand-computing IRR / capitalization / PV. Returns the full cashflow schedule (noi_impact, unlevered, cumulative, terminal exit-value delta), the value-creation waterfall (capitalized owner savings & ancillary ÷ exit cap, PV of BPS fine avoidance, net value creation), and irr_incremental. Supply only auditable inputs; do not pre-compute any derived field.',
+    {
+      flows: z.array(z.object({
+        year: z.number().int(),
+        incremental_capex: z.number().default(0).optional().describe('Incremental capex over like-for-like ($), this year'),
+        owner_utility_savings: z.number().default(0).optional().describe('Owner-share utility $ savings this year (landlord split only)'),
+        ancillary_revenue: z.number().default(0).optional().describe('Ancillary owner revenue this year (solar/EV/DR)'),
+        incentives: z.number().default(0).optional().describe('Incentives received this year ($)'),
+        bps_fine_avoidance: z.number().default(0).optional().describe('BPS fine avoided this year ($) — only if the plan is non-compliant on the governing pathway'),
+      })).min(1).describe('Per-year owner-share cash flows for the plan (already reflecting the owner/tenant split and any escalation)'),
+      exit_cap_rate: z.number().min(0.01).max(0.20).describe('Exit cap rate (e.g. 0.0515)'),
+      exit_year: z.number().int().describe('Hold exit year (terminal exit-value delta is booked here)'),
+      discount_rate: z.number().min(0).max(0.5).default(0.08).optional().describe('Discount rate for PV of the fine schedule (default 0.08)'),
+    },
+    async (inputs) => {
+      try {
+        const result = computePlanEconomics(inputs as any)
+        return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] }
+      } catch (e: any) {
+        return { content: [{ type: 'text' as const, text: `Error: ${e.message}` }], isError: true }
+      }
+    }
+  )
 
   return server
 }
