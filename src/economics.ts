@@ -11,6 +11,7 @@
 //   unlevered[y]           = noi_impact[y] - incremental_capex[y] + incentives[y]
 //   cumulative[y]          = running sum of unlevered
 //   asset_value_impact     = noi_impact[exit_year] / exit_cap_rate   (recurring owner NOI uplift capitalized at exit)
+//   irr_excl_exit          = IRR of the operating stream ONLY (no terminal exit-value residual) — the pays-for-itself screen
 //   irr_incremental        = IRR of the unlevered stream with asset_value_impact folded into the exit year (period 0 = first year)
 //   waterfall.capitalized_X = EXIT-YEAR (stabilized) run-rate of stream X / exit_cap_rate — capitalizes
 //                            what a buyer pays for at sale; util + ancillary + fine sum to asset_value_impact.
@@ -97,9 +98,17 @@ export function computePlanEconomics(input: PlanEconomicsInput) {
   let run = 0
   for (const c of cashflow) { run += c.unlevered_incremental_cashflow; c.cumulative = Math.round(run) }
 
-  // IRR of the unlevered stream with the terminal folded into the exit year (period 0 = first flow year)
-  const stream = cashflow.map((c) => c.unlevered_incremental_cashflow)
+  // Two IRRs on the unlevered stream (period 0 = first flow year):
+  //   irr_excl_exit   = operating cashflows ONLY (owner savings + ancillary + annual avoided fine
+  //                     − capex + incentives), NO terminal exit-value residual. The "does it pay for
+  //                     itself operationally" screen.
+  //   irr_incremental = the same stream WITH the terminal asset_value_impact folded into the exit
+  //                     year — the value-inclusive return (operating + exit residual).
+  const operatingStream = cashflow.map((c) => c.unlevered_incremental_cashflow)
   const exitIdx = cashflow.findIndex((c) => c.year === exitRow.year)
+  const rateExcl = irr(operatingStream)
+  const irr_excl_exit = rateExcl == null ? null : Math.round(rateExcl * 1000) / 1000
+  const stream = [...operatingStream]
   stream[exitIdx] += terminal
   const rate = irr(stream)
   const irr_incremental = rate == null ? null : Math.round(rate * 1000) / 1000
@@ -129,6 +138,7 @@ export function computePlanEconomics(input: PlanEconomicsInput) {
 
   return {
     irr_incremental,
+    irr_excl_exit,
     cashflow,
     waterfall: {
       incentives: Math.round(total_incentives),

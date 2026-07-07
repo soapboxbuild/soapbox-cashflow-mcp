@@ -188,7 +188,7 @@ server.tool(
   // against verified reports (see economics.test.ts).
   server.tool(
     'compute_plan_economics',
-    'Compute a decarbonization plan\'s value bridge and incremental IRR deterministically from per-year owner-share cash flows. Use this for EVERY decarb plan instead of hand-computing IRR / capitalization / PV. Returns the full cashflow schedule (noi_impact, unlevered, cumulative, terminal exit-value delta), the value-creation waterfall (capitalized owner savings & ancillary ÷ exit cap, PV of BPS fine avoidance, net value creation), and irr_incremental. Supply only auditable inputs; do not pre-compute any derived field.',
+    'Compute a decarbonization plan\'s value bridge and incremental IRR deterministically from per-year owner-share cash flows. Use this for EVERY decarb plan instead of hand-computing IRR / capitalization / PV. Returns the full cashflow schedule (noi_impact, unlevered, cumulative, terminal exit-value delta), the value-creation waterfall (capitalized owner savings/ancillary/fine-avoidance ÷ exit cap = exit_value_uplift, and net_value_creation = exit_value_uplift − capex + incentives), plus TWO IRRs: irr_excl_exit (operating cashflows only, NO exit residual — the pays-for-itself screen) and irr_incremental (value-inclusive, with the exit residual folded in). Supply only auditable inputs; do not pre-compute any derived field.',
     {
       flows: z.array(z.object({
         year: z.number().int(),
