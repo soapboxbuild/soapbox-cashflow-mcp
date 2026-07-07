@@ -12,10 +12,14 @@
 //   cumulative[y]          = running sum of unlevered
 //   asset_value_impact     = noi_impact[exit_year] / exit_cap_rate   (recurring owner NOI uplift capitalized at exit)
 //   irr_incremental        = IRR of the unlevered stream with asset_value_impact folded into the exit year (period 0 = first year)
-//   waterfall.capitalized_X = (going-in run-rate of stream X — its value in the first year it is nonzero) / exit_cap_rate
-//   waterfall.pv_bps_fine_avoidance = Σ fine[y] discounted at discount_rate to the first year
-//   net_value_creation     = -Σ incremental_capex + Σ incentives + capitalized_utility_savings
-//                            + capitalized_ancillary_revenue + pv_bps_fine_avoidance
+//   waterfall.capitalized_X = EXIT-YEAR (stabilized) run-rate of stream X / exit_cap_rate — capitalizes
+//                            what a buyer pays for at sale; util + ancillary + fine sum to asset_value_impact.
+//   waterfall.exit_value_uplift = asset_value_impact (the single headline value number)
+//   waterfall.pv_bps_fine_avoidance = Σ fine[y] discounted at discount_rate to the first year — CONTEXT only
+//                            (interim avoided-fine benefit), NOT a component of net_value_creation.
+//   net_value_creation     = -Σ incremental_capex + Σ incentives + exit_value_uplift
+//                            (= capitalized exit uplift net of the incremental capital spent to earn it;
+//                             reconciles exactly to asset_value_impact − net capex)
 
 export interface PlanFlowYear {
   year: number
@@ -100,24 +104,27 @@ export function computePlanEconomics(input: PlanEconomicsInput) {
   const rate = irr(stream)
   const irr_incremental = rate == null ? null : Math.round(rate * 1000) / 1000
 
-  // Going-in run-rate of a recurring stream = its value in the first year it is nonzero.
-  const goingIn = (key: 'owner_utility_savings' | 'ancillary_revenue') => {
-    for (const f of flows) { const v = num((f as any)[key]); if (v !== 0) return v }
-    return 0
-  }
-  const capitalized_utility_savings = Math.round(goingIn('owner_utility_savings') / exitCap)
-  const capitalized_ancillary_revenue = Math.round(goingIn('ancillary_revenue') / exitCap)
+  // Capitalize the EXIT-YEAR (stabilized) run-rate — the value a buyer capitalizes at sale.
+  // Using going-in (year-1) run-rate under-counts an ESCALATING stream, and made the waterfall
+  // disagree with asset_value_impact (which caps the exit-year NOI). Capitalize util, ancillary,
+  // AND avoided fine at the exit-year run-rate so the three sum to asset_value_impact.
+  const capitalized_utility_savings = Math.round(exitRow.utility_savings / exitCap)
+  const capitalized_ancillary_revenue = Math.round(exitRow.revenue / exitCap)
+  const capitalized_fine_avoidance = Math.round(exitRow.bps_fine_avoidance / exitCap)
 
-  // PV of the fine-avoidance schedule, discounted to the first flow year (period 0).
+  // PV of the fine-avoidance schedule, discounted to the first flow year — reported for CONTEXT
+  // (the interim avoided-fine benefit over the hold), NOT a component of net_value_creation.
   let pv_bps_fine_avoidance = 0
   flows.forEach((f, t) => { pv_bps_fine_avoidance += num(f.bps_fine_avoidance) / (1 + discount) ** t })
   pv_bps_fine_avoidance = Math.round(pv_bps_fine_avoidance)
 
   const total_incremental_capex = flows.reduce((s, f) => s + num(f.incremental_capex), 0)
   const total_incentives = flows.reduce((s, f) => s + num(f.incentives), 0)
+  // Net value creation = capitalized exit-value uplift (asset_value_impact) net of incremental
+  // capex, plus incentives. Reconciles EXACTLY to the terminal asset_value_impact booked above:
+  // capitalized_utility + capitalized_ancillary + capitalized_fine ≈ asset_value_impact.
   const net_value_creation = Math.round(
-    -total_incremental_capex + total_incentives + capitalized_utility_savings +
-    capitalized_ancillary_revenue + pv_bps_fine_avoidance,
+    -total_incremental_capex + total_incentives + terminal,
   )
 
   return {
@@ -129,6 +136,8 @@ export function computePlanEconomics(input: PlanEconomicsInput) {
       incremental_capex: -Math.round(total_incremental_capex),
       capitalized_utility_savings,
       capitalized_ancillary_revenue,
+      capitalized_fine_avoidance,
+      exit_value_uplift: terminal,
       pv_bps_fine_avoidance,
       net_value_creation,
     },
