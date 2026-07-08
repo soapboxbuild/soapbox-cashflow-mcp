@@ -25,7 +25,22 @@
 export interface PlanFlowYear {
   year: number
   incremental_capex?: number
+  /** Owner-share utility savings for the year. Either pass this directly (already capture-applied),
+   *  OR pass the gross-by-source fields below and the engine applies capture (preferred — keeps the
+   *  landlord-share application inside the economics layer so a caller can't feed gross-as-owner). */
   owner_utility_savings?: number
+  // ── Gross (pre-capture) utility savings by source + the owner capture to apply. Used only when
+  //    owner_utility_savings is not provided. Efficiency savings capture at the per-fuel landlord
+  //    share; solar (BTM/VNM) captures at solar_capture (0.80 where VNM/export is permitted — the LL
+  //    owns the array and allocates the credit — else the displaced-load share). NEVER use Audette's
+  //    `landlord_utility_cost_savings` here: Audette does not apply the building landlord-share to it
+  //    (it equals gross), so feed Audette's GROSS `utility_cost_savings` split by fuel.
+  gross_elec_savings?: number
+  gross_gas_savings?: number
+  gross_solar_savings?: number
+  elec_capture?: number
+  gas_capture?: number
+  solar_capture?: number
   ancillary_revenue?: number
   incentives?: number
   bps_fine_avoidance?: number
@@ -68,7 +83,16 @@ export function computePlanEconomics(input: PlanEconomicsInput) {
 
   // Per-year schedule
   const cashflow = flows.map((f) => {
-    const util = num(f.owner_utility_savings)
+    // Owner utility savings: use the directly-supplied value if given, else apply capture to the
+    // gross-by-source fields IN THE ENGINE (efficiency at per-fuel landlord share; solar at its
+    // VNM/BTM capture, default 0.80 where VNM). This keeps landlord-share application inside the
+    // economics layer — never trust an upstream (e.g. Audette) "landlord savings" field, which is
+    // uncaptured (= gross).
+    const util = f.owner_utility_savings != null
+      ? num(f.owner_utility_savings)
+      : num(f.elec_capture) * num(f.gross_elec_savings)
+        + num(f.gas_capture) * num(f.gross_gas_savings)
+        + (f.solar_capture != null ? num(f.solar_capture) : 0.80) * num(f.gross_solar_savings)
     const anc = num(f.ancillary_revenue)
     const fine = num(f.bps_fine_avoidance)
     const capex = num(f.incremental_capex)
