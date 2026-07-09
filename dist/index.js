@@ -211,6 +211,7 @@ function createServer() {
     server.tool('compute_portfolio_economics', 'Run compute_plan_economics for EVERY asset in a portfolio in ONE call and return per-asset economics + portfolio aggregates + an engine provenance stamp. Use this for the portfolio-analysis economics instead of calling compute_plan_economics per asset or hand-computing/aggregating IRR & value in code — you supply only auditable per-year owner-share flows per asset; the deterministic engine does all the money-math. Returns { provenance, portfolio:{assets_above_hurdle,total_value_creation,total_incremental_capex,...}, assets:[{asset_name,fund,irr_excl_exit,irr_incremental,net_value_creation,exit_value_uplift,above_hurdle,waterfall}] }. Report these values verbatim; never recompute them.', {
         irr_hurdle: z.number().min(0).max(1).default(0.15).describe('IRR hurdle for the above_hurdle flag (default 0.15). Uses irr_incremental.'),
         d_exit_year: z.number().int().default(2040).optional().describe('Hold horizon for the Scenario D (next-owner) screen (default 2040).'),
+        crrem_target_annual: z.array(z.object({ year: z.number().int(), target: z.number() })).optional().describe('Pre-blended portfolio CRREM 1.5C target curve (kgCO2e/m2 by year) from crrem get_portfolio_pathway.blended_pathway — pass it verbatim. Used directly for the trajectory crrem_target; avoids per-asset crrem_annual and the large per-region pathway payloads.'),
         assets: z.array(z.object({
             asset_id: z.string().optional().describe('Soapbox asset UUID (echoed back for joining).'),
             asset_name: z.string().describe('Asset name for the rollup rows.'),
@@ -233,7 +234,7 @@ function createServer() {
             grid_ef_annual: z.array(z.object({ year: z.number().int(), factor: z.number() })).optional().describe('Electricity emission factor by year (from crrem get_emission_factors). Normalised to year_start internally — supply the real series, do not pre-normalise.'),
             crrem_annual: z.array(z.object({ year: z.number().int(), target: z.number() })).optional().describe('This asset’s CRREM 1.5°C pathway kgCO₂e/m² by year, VERBATIM from crrem get_pathway allYears. GFA-weighted into the portfolio crrem_target — never hand-blend.'),
         })).min(1).max(500).describe('Every analysis-ready asset with its assembled flows (or per-measure flows + carbon inputs for the trajectory).'),
-    }, async ({ irr_hurdle, d_exit_year, assets }) => {
+    }, async ({ irr_hurdle, d_exit_year, crrem_target_annual, assets }) => {
         try {
             const hurdle = irr_hurdle ?? 0.15;
             // Single source of truth: when per-measure flows exist, the asset-level economics
@@ -299,12 +300,13 @@ function createServer() {
             // Deterministic emissions trajectory + GFA-weighted CRREM overlay — computed only when
             // the carbon inputs are supplied; the agent copies these arrays verbatim (no hand-blending).
             let trajectory = null;
-            const anyCarbon = assets.some((a) => a.crrem_annual || a.measures || a.baseline_intensity_2025 != null);
+            const anyCarbon = (crrem_target_annual && crrem_target_annual.length > 0) || assets.some((a) => a.crrem_annual || a.measures || a.baseline_intensity_2025 != null);
             if (anyCarbon) {
                 try {
                     trajectory = computePortfolioTrajectory({
                         irr_hurdle: hurdle,
                         d_exit_year,
+                        crrem_target_annual: crrem_target_annual,
                         assets: assets.map((a) => ({
                             asset_name: a.asset_name,
                             gfa_m2: a.gfa_m2,

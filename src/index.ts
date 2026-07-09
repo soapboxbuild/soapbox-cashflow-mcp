@@ -250,6 +250,7 @@ server.tool(
     {
       irr_hurdle: z.number().min(0).max(1).default(0.15).describe('IRR hurdle for the above_hurdle flag (default 0.15). Uses irr_incremental.'),
       d_exit_year: z.number().int().default(2040).optional().describe('Hold horizon for the Scenario D (next-owner) screen (default 2040).'),
+      crrem_target_annual: z.array(z.object({ year: z.number().int(), target: z.number() })).optional().describe('Pre-blended portfolio CRREM 1.5C target curve (kgCO2e/m2 by year) from crrem get_portfolio_pathway.blended_pathway — pass it verbatim. Used directly for the trajectory crrem_target; avoids per-asset crrem_annual and the large per-region pathway payloads.'),
       assets: z.array(z.object({
         asset_id: z.string().optional().describe('Soapbox asset UUID (echoed back for joining).'),
         asset_name: z.string().describe('Asset name for the rollup rows.'),
@@ -273,7 +274,7 @@ server.tool(
         crrem_annual: z.array(z.object({ year: z.number().int(), target: z.number() })).optional().describe('This asset’s CRREM 1.5°C pathway kgCO₂e/m² by year, VERBATIM from crrem get_pathway allYears. GFA-weighted into the portfolio crrem_target — never hand-blend.'),
       })).min(1).max(500).describe('Every analysis-ready asset with its assembled flows (or per-measure flows + carbon inputs for the trajectory).'),
     },
-    async ({ irr_hurdle, d_exit_year, assets }) => {
+    async ({ irr_hurdle, d_exit_year, crrem_target_annual, assets }) => {
       try {
         const hurdle = irr_hurdle ?? 0.15
         // Single source of truth: when per-measure flows exist, the asset-level economics
@@ -336,12 +337,13 @@ server.tool(
         // Deterministic emissions trajectory + GFA-weighted CRREM overlay — computed only when
         // the carbon inputs are supplied; the agent copies these arrays verbatim (no hand-blending).
         let trajectory: any = null
-        const anyCarbon = assets.some((a) => a.crrem_annual || a.measures || a.baseline_intensity_2025 != null)
+        const anyCarbon = (crrem_target_annual && crrem_target_annual.length > 0) || assets.some((a) => a.crrem_annual || a.measures || a.baseline_intensity_2025 != null)
         if (anyCarbon) {
           try {
             trajectory = computePortfolioTrajectory({
               irr_hurdle: hurdle,
               d_exit_year,
+              crrem_target_annual: crrem_target_annual as any,
               assets: assets.map((a) => ({
                 asset_name: a.asset_name,
                 gfa_m2: a.gfa_m2,

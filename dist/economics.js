@@ -177,7 +177,12 @@ export function computePortfolioTrajectory(input) {
     const totalGfa = input.assets.reduce((s, a) => s + num(a.gfa_m2), 0);
     // Which series can we build? (graceful degradation — the CRREM blend, the
     // main fabrication risk, computes even if scenario inputs are incomplete.)
-    const crremReady = totalGfa > 0 && input.assets.every((a) => num(a.gfa_m2) > 0 && Array.isArray(a.crrem_annual) && a.crrem_annual.length > 0);
+    // Prefer the pre-blended portfolio curve from get_portfolio_pathway (server-side blend);
+    // fall back to GFA-blending per-asset crrem_annual only if the pre-blended curve is absent.
+    const preBlendedCrrem = Array.isArray(input.crrem_target_annual) && input.crrem_target_annual.length > 0
+        ? input.crrem_target_annual.map((p) => ({ year: p.year, value: num(p.target) }))
+        : null;
+    const crremReady = !!preBlendedCrrem || (totalGfa > 0 && input.assets.every((a) => num(a.gfa_m2) > 0 && Array.isArray(a.crrem_annual) && a.crrem_annual.length > 0));
     const scenReady = totalGfa > 0 && input.assets.every((a) => num(a.gfa_m2) > 0 &&
         Number.isFinite(Number(a.baseline_intensity_2025)) &&
         Number.isFinite(Number(a.scope2_fraction)) &&
@@ -208,14 +213,20 @@ export function computePortfolioTrajectory(input) {
     // ── Year-by-year GFA-weighted portfolio series ──
     const traj = years.map((Y) => {
         const row = { year: Y };
-        // CRREM target — GFA-weighted blend of the per-asset tool-fetched pathways.
+        // CRREM target — the pre-blended portfolio curve (get_portfolio_pathway) verbatim,
+        // else a GFA-weighted blend of per-asset tool-fetched pathways (fallback).
         if (crremReady) {
-            let acc = 0;
-            for (const a of input.assets) {
-                const v = seriesAt((a.crrem_annual || []).map((p) => ({ year: p.year, value: num(p.target) })), Y);
-                acc += (v ?? 0) * num(a.gfa_m2);
+            if (preBlendedCrrem) {
+                row.crrem_target = r1(seriesAt(preBlendedCrrem, Y) ?? 0);
             }
-            row.crrem_target = r1(acc / totalGfa);
+            else {
+                let acc = 0;
+                for (const a of input.assets) {
+                    const v = seriesAt((a.crrem_annual || []).map((p) => ({ year: p.year, value: num(p.target) })), Y);
+                    acc += (v ?? 0) * num(a.gfa_m2);
+                }
+                row.crrem_target = r1(acc / totalGfa);
+            }
         }
         // BAU + scenarios (portfolio GFA-weighted intensity).
         if (scenReady) {
