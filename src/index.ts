@@ -3,7 +3,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { z } from 'zod'
 import { execFileSync } from 'child_process'
-import { computePlanEconomics } from './economics.js'
+import { computePlanEconomics, computePortfolioTrajectory } from './economics.js'
 
 const SCRIPTS_DIR = process.env.SCRIPTS_DIR ?? '/home/claude/soapbox-agent/scripts'
 
@@ -243,22 +243,58 @@ server.tool(
     'Run compute_plan_economics for EVERY asset in a portfolio in ONE call and return per-asset economics + portfolio aggregates + an engine provenance stamp. Use this for the portfolio-analysis economics instead of calling compute_plan_economics per asset or hand-computing/aggregating IRR & value in code — you supply only auditable per-year owner-share flows per asset; the deterministic engine does all the money-math. Returns { provenance, portfolio:{assets_above_hurdle,total_value_creation,total_incremental_capex,...}, assets:[{asset_name,fund,irr_excl_exit,irr_incremental,net_value_creation,exit_value_uplift,above_hurdle,waterfall}] }. Report these values verbatim; never recompute them.',
     {
       irr_hurdle: z.number().min(0).max(1).default(0.15).describe('IRR hurdle for the above_hurdle flag (default 0.15). Uses irr_incremental.'),
+      d_exit_year: z.number().int().default(2040).optional().describe('Hold horizon for the Scenario D (next-owner) screen (default 2040).'),
       assets: z.array(z.object({
         asset_id: z.string().optional().describe('Soapbox asset UUID (echoed back for joining).'),
         asset_name: z.string().describe('Asset name for the rollup rows.'),
         fund: z.string().optional().describe('Fund name for fund-level aggregation.'),
-        flows: z.array(portfolioFlowYear).min(1).describe('Per-year owner-share flows for this asset (same shape as compute_plan_economics).'),
+        flows: z.array(portfolioFlowYear).min(1).optional().describe('LEGACY / economics-only: per-year owner-share flows for this asset. Prefer `measures` (below) — when `measures` is present it is the SOLE source and `flows` is ignored, so trajectory and headline economics cannot diverge.'),
+        measures: z.array(z.object({
+          install_year: z.number().int(),
+          annual_tco2e_reduction: z.number().default(0),
+          is_solar: z.boolean().optional().describe('Force-included in Scenario C (max solar).'),
+          compliance_required: z.boolean().optional().describe('Force-included in ALL scenarios (regulatory).'),
+          flows: z.array(portfolioFlowYear).min(1).describe('This measure’s own per-year owner-share flows (same shape as compute_plan_economics).'),
+        })).optional().describe('Per-MEASURE flows. Enables the deterministic A/B/C/D emissions scenarios AND is summed to the asset-level economics (single source of truth). Screened per measure: A=irr_excl_exit≥hurdle, B=+irr_incremental≥hurdle, C=+all solar, D=+screen re-run at d_exit_year.'),
         exit_cap_rate: z.number().min(0.01).max(0.20),
         exit_year: z.number().int(),
         discount_rate: z.number().min(0).max(0.5).default(0.08).optional(),
-      })).min(1).max(500).describe('Every analysis-ready asset with its assembled flows.'),
+        // ── Optional carbon inputs for the emissions trajectory + CRREM overlay ──
+        gfa_m2: z.number().positive().optional().describe('Gross floor area (m²) — GFA-weighting for portfolio curves.'),
+        baseline_intensity_2025: z.number().optional().describe('Baseline carbon intensity kgCO₂e/m² at year_start.'),
+        scope2_fraction: z.number().min(0).max(1).optional().describe('Electricity (Scope-2) share of baseline emissions; only this share decays with the grid under BAU.'),
+        grid_ef_annual: z.array(z.object({ year: z.number().int(), factor: z.number() })).optional().describe('Electricity emission factor by year (from crrem get_emission_factors). Normalised to year_start internally — supply the real series, do not pre-normalise.'),
+        crrem_annual: z.array(z.object({ year: z.number().int(), target: z.number() })).optional().describe('This asset’s CRREM 1.5°C pathway kgCO₂e/m² by year, VERBATIM from crrem get_pathway allYears. GFA-weighted into the portfolio crrem_target — never hand-blend.'),
+      })).min(1).max(500).describe('Every analysis-ready asset with its assembled flows (or per-measure flows + carbon inputs for the trajectory).'),
     },
-    async ({ irr_hurdle, assets }) => {
+    async ({ irr_hurdle, d_exit_year, assets }) => {
       try {
         const hurdle = irr_hurdle ?? 0.15
+        // Single source of truth: when per-measure flows exist, the asset-level economics
+        // are computed from the SUM of the same measure flows (owner-share resolved per
+        // measure, then summed), so the headline value can't drift from the trajectory.
+        const ownerFlowsFromMeasures = (measures: any[]): any[] => {
+          const byYear = new Map<number, any>()
+          for (const m of measures) for (const f of (m.flows ?? [])) {
+            const owner = f.owner_utility_savings != null ? Number(f.owner_utility_savings)
+              : (Number(f.gross_elec_savings ?? 0) * Number(f.elec_capture ?? 0)
+                + Number(f.gross_gas_savings ?? 0) * Number(f.gas_capture ?? 0)
+                + Number(f.gross_solar_savings ?? 0) * Number(f.solar_capture ?? 0))
+            const cur = byYear.get(f.year) ?? { year: f.year, incremental_capex: 0, owner_utility_savings: 0, ancillary_revenue: 0, incentives: 0, bps_fine_avoidance: 0 }
+            cur.incremental_capex += Number(f.incremental_capex ?? 0)
+            cur.owner_utility_savings += owner
+            cur.ancillary_revenue += Number(f.ancillary_revenue ?? 0)
+            cur.incentives += Number(f.incentives ?? 0)
+            cur.bps_fine_avoidance += Number(f.bps_fine_avoidance ?? 0)
+            byYear.set(f.year, cur)
+          }
+          return Array.from(byYear.values()).sort((x, y) => x.year - y.year)
+        }
         const per = assets.map((a) => {
           try {
-            const r = computePlanEconomics({ flows: a.flows as any, exit_cap_rate: a.exit_cap_rate, exit_year: a.exit_year, discount_rate: a.discount_rate })
+            const flows = (a.measures && a.measures.length) ? ownerFlowsFromMeasures(a.measures) : (a.flows as any)
+            if (!flows || !flows.length) throw new Error('asset has neither measures nor flows')
+            const r = computePlanEconomics({ flows: flows as any, exit_cap_rate: a.exit_cap_rate, exit_year: a.exit_year, discount_rate: a.discount_rate })
             return {
               asset_name: a.asset_name,
               asset_id: a.asset_id ?? null,
@@ -291,11 +327,38 @@ server.tool(
           funds[k].above_hurdle += p.above_hurdle ? 1 : 0
         }
         Object.values(funds).forEach((f) => { f.value_creation = round(f.value_creation); f.incremental_capex = round(f.incremental_capex) })
+        // Deterministic emissions trajectory + GFA-weighted CRREM overlay — computed only when
+        // the carbon inputs are supplied; the agent copies these arrays verbatim (no hand-blending).
+        let trajectory: any = null
+        const anyCarbon = assets.some((a) => a.crrem_annual || a.measures || a.baseline_intensity_2025 != null)
+        if (anyCarbon) {
+          try {
+            trajectory = computePortfolioTrajectory({
+              irr_hurdle: hurdle,
+              d_exit_year,
+              assets: assets.map((a) => ({
+                asset_name: a.asset_name,
+                gfa_m2: a.gfa_m2,
+                baseline_intensity_2025: a.baseline_intensity_2025,
+                scope2_fraction: a.scope2_fraction,
+                grid_ef_annual: a.grid_ef_annual as any,
+                crrem_annual: a.crrem_annual as any,
+                exit_cap_rate: a.exit_cap_rate,
+                exit_year: a.exit_year,
+                discount_rate: a.discount_rate,
+                measures: a.measures as any,
+              })),
+            })
+          } catch (e: any) {
+            trajectory = { error: e.message }
+          }
+        }
         const result = {
-          provenance: { engine: 'compute_plan_economics', tool: 'compute_portfolio_economics', version: '1.0', computed: ok.length, errored: per.length - ok.length },
+          provenance: { engine: 'compute_plan_economics', tool: 'compute_portfolio_economics', version: trajectory ? '1.1' : '1.0', computed: ok.length, errored: per.length - ok.length },
           portfolio: { irr_hurdle: hurdle, assets_evaluated: per.length, assets_above_hurdle, total_value_creation, total_incremental_capex },
           funds,
           assets: per,
+          ...(trajectory ? { trajectory } : {}),
         }
         return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] }
       } catch (e: any) {

@@ -177,3 +177,198 @@ export function computePlanEconomics(input: PlanEconomicsInput) {
     },
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Portfolio emissions trajectory + GFA-weighted CRREM overlay (deterministic).
+//
+// WHY THIS EXISTS: the A/B/C/D scenario curves and the CRREM 1.5°C target were
+// hand-assembled by the model (per-year, per-measure, GFA-weighted across N
+// regional pathways). That arithmetic got approximated — the agent anchored on
+// the reported target years and eyeballed the intervening annual points,
+// producing fabricated one-year cliffs in the CRREM line and a suspiciously
+// constant A–B gap. This function does that arithmetic deterministically so the
+// agent copies the returned arrays verbatim and cannot drift.
+//
+// SINGLE SOURCE OF TRUTH: scenario membership is screened from each measure's
+// OWN flows via computePlanEconomics (2031 exit → irr_excl_exit / irr_incremental;
+// d_exit_year exit → the next-owner screen). The same per-measure flows sum to
+// the asset-level economics, so trajectory and headline value can't diverge.
+//
+// NESTING BY CONSTRUCTION: A ⊆ B ⊆ C ⊆ D as cumulative set unions
+// (B = A ∪ value-inclusive; C = B ∪ all solar; D = C ∪ 2040-screen), so residual
+// intensities are bau ≥ a ≥ b ≥ c ≥ d every year. Asserted at the end.
+//
+// SOURCED PHYSICS: BAU decays only the Scope-2 (electricity) share, by the
+// per-asset supplied grid emission-factor series (normalised to the base year) —
+// the tool AGGREGATES supplied rates, it never authors emission factors.
+//
+// KNOWN v1 APPROXIMATION (disclosed in the returned methodology note): a
+// measure's annual_tco2e_reduction is treated as constant, subtracted from a
+// declining BAU. As the grid cleans up, an electric measure actually avoids
+// fewer tonnes in later years, so late-year savings are slightly over-counted.
+// Monotonic non-increasing is still guaranteed; a future v2 scales electric
+// measures by the grid factor.
+export interface TrajectoryMeasure {
+  install_year: number
+  annual_tco2e_reduction: number
+  is_solar?: boolean
+  compliance_required?: boolean
+  flows: PlanFlowYear[]
+}
+export interface TrajectoryAsset {
+  asset_name: string
+  gfa_m2?: number
+  baseline_intensity_2025?: number // kgCO2e/m2
+  scope2_fraction?: number // 0..1 electricity share of baseline emissions
+  grid_ef_annual?: { year: number; factor: number }[] // electricity EF by year (any unit; normalised to base year)
+  crrem_annual?: { year: number; target: number }[] // kgCO2e/m2 target by year
+  exit_cap_rate: number
+  exit_year: number
+  discount_rate?: number
+  measures?: TrajectoryMeasure[]
+}
+export interface TrajectoryInput {
+  assets: TrajectoryAsset[]
+  irr_hurdle: number
+  d_exit_year?: number
+  year_start?: number
+  year_end?: number
+}
+
+const r1 = (n: number) => Math.round(n * 10) / 10
+
+/** Linear-interpolate/hold a {year,value} series at an arbitrary year. */
+function seriesAt(points: { year: number; value: number }[], year: number): number | null {
+  if (!points.length) return null
+  const s = points.slice().sort((a, b) => a.year - b.year)
+  if (year <= s[0].year) return s[0].value
+  if (year >= s[s.length - 1].year) return s[s.length - 1].value
+  const lo = s.filter((p) => p.year <= year).pop()!
+  const hi = s.filter((p) => p.year >= year).shift()!
+  if (hi.year === lo.year) return lo.value
+  const t = (year - lo.year) / (hi.year - lo.year)
+  return lo.value + t * (hi.value - lo.value)
+}
+
+export function computePortfolioTrajectory(input: TrajectoryInput) {
+  const hurdle = num(input.irr_hurdle ?? 0.15)
+  const dExit = input.d_exit_year ?? 2040
+  const y0 = input.year_start ?? 2025
+  const y1 = input.year_end ?? 2050
+  const years: number[] = []
+  for (let y = y0; y <= y1; y++) years.push(y)
+
+  const totalGfa = input.assets.reduce((s, a) => s + num(a.gfa_m2), 0)
+
+  // Which series can we build? (graceful degradation — the CRREM blend, the
+  // main fabrication risk, computes even if scenario inputs are incomplete.)
+  const crremReady = totalGfa > 0 && input.assets.every((a) => num(a.gfa_m2) > 0 && Array.isArray(a.crrem_annual) && a.crrem_annual.length > 0)
+  const scenReady = totalGfa > 0 && input.assets.every((a) =>
+    num(a.gfa_m2) > 0 &&
+    Number.isFinite(Number(a.baseline_intensity_2025)) &&
+    Number.isFinite(Number(a.scope2_fraction)) &&
+    Array.isArray(a.grid_ef_annual) && a.grid_ef_annual!.length > 0 &&
+    Array.isArray(a.measures))
+
+  const missing: string[] = []
+  if (!crremReady) missing.push('crrem_target (needs every asset to have gfa_m2 + crrem_annual)')
+  if (!scenReady) missing.push('scenario_a..d (needs every asset to have gfa_m2 + baseline_intensity_2025 + scope2_fraction + grid_ef_annual + measures)')
+
+  // ── Per-asset scenario membership (only if scenReady) ──
+  const membership: any[] = []
+  if (scenReady) {
+    for (const a of input.assets) {
+      const disc = a.discount_rate
+      for (const m of a.measures!) {
+        const e31 = computePlanEconomics({ flows: m.flows, exit_cap_rate: a.exit_cap_rate, exit_year: a.exit_year, discount_rate: disc })
+        const e40 = computePlanEconomics({ flows: m.flows, exit_cap_rate: a.exit_cap_rate, exit_year: dExit, discount_rate: disc })
+        const comp = m.compliance_required === true
+        const inA = comp || (e31.irr_excl_exit != null && e31.irr_excl_exit >= hurdle)
+        const inB = inA || (e31.irr_incremental != null && e31.irr_incremental >= hurdle) // B ⊇ A
+        const inC = inB || m.is_solar === true // C ⊇ B (force all solar)
+        const inD = inC || (e40.irr_incremental != null && e40.irr_incremental >= hurdle) // D ⊇ C
+        membership.push({ asset: a.asset_name, gfa: num(a.gfa_m2), install_year: m.install_year, tco2e: num(m.annual_tco2e_reduction), inA, inB, inC, inD })
+      }
+    }
+  }
+
+  // ── Year-by-year GFA-weighted portfolio series ──
+  const traj = years.map((Y) => {
+    const row: any = { year: Y }
+
+    // CRREM target — GFA-weighted blend of the per-asset tool-fetched pathways.
+    if (crremReady) {
+      let acc = 0
+      for (const a of input.assets) {
+        const v = seriesAt((a.crrem_annual || []).map((p) => ({ year: p.year, value: num(p.target) })), Y)
+        acc += (v ?? 0) * num(a.gfa_m2)
+      }
+      row.crrem_target = r1(acc / totalGfa)
+    }
+
+    // BAU + scenarios (portfolio GFA-weighted intensity).
+    if (scenReady) {
+      let bau = 0, sa = 0, sb = 0, sc = 0, sd = 0
+      for (const a of input.assets) {
+        const gfa = num(a.gfa_m2)
+        const base = num(a.baseline_intensity_2025)
+        const s2 = Math.max(0, Math.min(1, num(a.scope2_fraction)))
+        const ef = (a.grid_ef_annual || []).map((p) => ({ year: p.year, value: num(p.factor) }))
+        const efBase = seriesAt(ef, y0) || 1
+        const gridIdx = (seriesAt(ef, Y) ?? efBase) / (efBase || 1)
+        // Scope-1 flat, Scope-2 tracks the grid factor.
+        const bauInt = base * ((1 - s2) + s2 * gridIdx)
+        // Cumulative intensity reduction from measures installed by year Y, per scenario.
+        const red = (pred: (m: any) => boolean) => (a.measures || [])
+          .filter((m) => m.install_year <= Y && pred(m))
+          .reduce((s, m) => s + (num(m.annual_tco2e_reduction) * 1000) / gfa, 0) // tCO2e → kgCO2e/m2
+        const memOf = (m: TrajectoryMeasure) => membership.find((x) => x.asset === a.asset_name && x.install_year === m.install_year && x.tco2e === num(m.annual_tco2e_reduction)) || {}
+        const clampInt = (v: number) => Math.max(0, v)
+        bau += bauInt * gfa
+        sa += clampInt(bauInt - red((m) => memOf(m).inA)) * gfa
+        sb += clampInt(bauInt - red((m) => memOf(m).inB)) * gfa
+        sc += clampInt(bauInt - red((m) => memOf(m).inC)) * gfa
+        sd += clampInt(bauInt - red((m) => memOf(m).inD)) * gfa
+      }
+      row.bau = r1(bau / totalGfa)
+      row.scenario_a = r1(sa / totalGfa)
+      row.scenario_b = r1(sb / totalGfa)
+      row.scenario_c = r1(sc / totalGfa)
+      row.scenario_d = r1(sd / totalGfa)
+    }
+    return row
+  })
+
+  // ── Assert nesting + monotonicity (skill sanity gate, SKILL.md:1235) ──
+  if (scenReady) {
+    for (const row of traj) {
+      const seq = [row.bau, row.scenario_a, row.scenario_b, row.scenario_c, row.scenario_d]
+      for (let i = 1; i < seq.length; i++) {
+        if (seq[i] > seq[i - 1] + 1e-6) throw new Error(`Trajectory nesting violated at ${row.year}: BAU>=A>=B>=C>=D expected, got ${seq.join(' ')}`)
+      }
+    }
+    for (const key of ['bau', 'scenario_a', 'scenario_b', 'scenario_c', 'scenario_d']) {
+      for (let i = 1; i < traj.length; i++) {
+        if (traj[i][key] > traj[i - 1][key] + 1e-6) throw new Error(`Trajectory ${key} not non-increasing at ${traj[i].year}`)
+      }
+    }
+  }
+
+  const at = (Y: number, key: string) => { const r = traj.find((t) => t.year === Y); return r ? r[key] : null }
+  const crrem_trajectory = crremReady ? {
+    current_intensity: scenReady ? at(y0, 'bau') : null,
+    with_measures_intensity: scenReady ? at(dExit, 'scenario_b') : null,
+    crrem_2030: at(2030, 'crrem_target'),
+    crrem_2035: at(2035, 'crrem_target'),
+    crrem_2040: at(2040, 'crrem_target'),
+  } : null
+
+  return {
+    emissions_trajectory: traj,
+    crrem_trajectory,
+    scenario_membership: scenReady ? membership : null,
+    incomplete: missing.length ? missing : null,
+    methodology_note:
+      'Trajectory computed deterministically by compute_portfolio_economics: CRREM target = GFA-weighted blend of per-asset get_pathway curves; scenarios A⊆B⊆C⊆D screened from each measure’s own flows (A=irr_excl_exit≥hurdle, B=+irr_incremental≥hurdle, C=+all solar, D=+2040-horizon screen), BAU decays the Scope-2 share by the supplied grid emission-factor series. v1 treats each measure’s annual tCO2e as constant; because the grid decarbonises, late-year electric savings are marginally over-counted.',
+  }
+}
