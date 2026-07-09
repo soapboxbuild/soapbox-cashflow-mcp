@@ -193,8 +193,14 @@ server.tool(
       flows: z.array(z.object({
         year: z.number().int(),
         incremental_capex: z.number().default(0).optional().describe('Incremental capex over like-for-like ($), this year'),
-        owner_utility_savings: z.number().default(0).optional().describe('Owner-share utility $ savings this year (landlord split only)'),
-        ancillary_revenue: z.number().default(0).optional().describe('Ancillary owner revenue this year (solar/EV/DR)'),
+        owner_utility_savings: z.number().default(0).optional().describe('Owner-share utility $ savings this year (already capture-applied). Prefer the gross_*+*_capture fields below so the engine applies the landlord share itself.'),
+        gross_elec_savings: z.number().optional().describe('GROSS (pre-capture) electricity $ savings this year, efficiency measures. Use Audette utility_cost_savings, NOT landlord_utility_cost_savings (which is uncaptured = gross).'),
+        gross_gas_savings: z.number().optional().describe('GROSS (pre-capture) gas $ savings this year, efficiency measures.'),
+        gross_solar_savings: z.number().optional().describe('GROSS (pre-capture) solar/PV $ savings this year (BTM/VNM).'),
+        elec_capture: z.number().min(0).max(1).optional().describe('Owner landlord share for electricity efficiency savings (0-1), e.g. 0.10.'),
+        gas_capture: z.number().min(0).max(1).optional().describe('Owner landlord share for gas efficiency savings (0-1).'),
+        solar_capture: z.number().min(0).max(1).optional().describe('Owner share of solar savings; 0.80 where BTM/VNM export is permitted (LL owns array + allocates credit), else the displaced-load share. Defaults to 0.80 if solar savings given without a capture.'),
+        ancillary_revenue: z.number().default(0).optional().describe('Ancillary owner revenue this year (sub-metering/billing, EV, DR) — LL keeps 100% regardless of utility split.'),
         incentives: z.number().default(0).optional().describe('Incentives received this year ($)'),
         bps_fine_avoidance: z.number().default(0).optional().describe('BPS fine avoided this year ($) — only if the plan is non-compliant on the governing pathway'),
       })).min(1).describe('Per-year owner-share cash flows for the plan (already reflecting the owner/tenant split and any escalation)'),
@@ -205,6 +211,92 @@ server.tool(
     async (inputs) => {
       try {
         const result = computePlanEconomics(inputs as any)
+        return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] }
+      } catch (e: any) {
+        return { content: [{ type: 'text' as const, text: `Error: ${e.message}` }], isError: true }
+      }
+    }
+  )
+
+  // ── Portfolio-scale economics: run compute_plan_economics for EVERY asset in ONE call ──
+  // Purpose-built for portfolio-analysis: the agent supplies only per-asset INPUTS (the same
+  // auditable per-year flows compute_plan_economics takes); this tool runs the deterministic engine
+  // for each asset server-side, aggregates the portfolio rollups, and stamps engine provenance.
+  // The agent never computes IRR/value itself — so hand-rolled/"Python replica" economics are
+  // impossible — and one MCP call replaces ~39 per-asset round-trips (no requires_action churn).
+  const portfolioFlowYear = z.object({
+    year: z.number().int(),
+    incremental_capex: z.number().optional(),
+    owner_utility_savings: z.number().optional(),
+    gross_elec_savings: z.number().optional(),
+    gross_gas_savings: z.number().optional(),
+    gross_solar_savings: z.number().optional(),
+    elec_capture: z.number().min(0).max(1).optional(),
+    gas_capture: z.number().min(0).max(1).optional(),
+    solar_capture: z.number().min(0).max(1).optional(),
+    ancillary_revenue: z.number().optional(),
+    incentives: z.number().optional(),
+    bps_fine_avoidance: z.number().optional(),
+  })
+  server.tool(
+    'compute_portfolio_economics',
+    'Run compute_plan_economics for EVERY asset in a portfolio in ONE call and return per-asset economics + portfolio aggregates + an engine provenance stamp. Use this for the portfolio-analysis economics instead of calling compute_plan_economics per asset or hand-computing/aggregating IRR & value in code — you supply only auditable per-year owner-share flows per asset; the deterministic engine does all the money-math. Returns { provenance, portfolio:{assets_above_hurdle,total_value_creation,total_incremental_capex,...}, assets:[{asset_name,fund,irr_excl_exit,irr_incremental,net_value_creation,exit_value_uplift,above_hurdle,waterfall}] }. Report these values verbatim; never recompute them.',
+    {
+      irr_hurdle: z.number().min(0).max(1).default(0.15).describe('IRR hurdle for the above_hurdle flag (default 0.15). Uses irr_incremental.'),
+      assets: z.array(z.object({
+        asset_id: z.string().optional().describe('Soapbox asset UUID (echoed back for joining).'),
+        asset_name: z.string().describe('Asset name for the rollup rows.'),
+        fund: z.string().optional().describe('Fund name for fund-level aggregation.'),
+        flows: z.array(portfolioFlowYear).min(1).describe('Per-year owner-share flows for this asset (same shape as compute_plan_economics).'),
+        exit_cap_rate: z.number().min(0.01).max(0.20),
+        exit_year: z.number().int(),
+        discount_rate: z.number().min(0).max(0.5).default(0.08).optional(),
+      })).min(1).max(500).describe('Every analysis-ready asset with its assembled flows.'),
+    },
+    async ({ irr_hurdle, assets }) => {
+      try {
+        const hurdle = irr_hurdle ?? 0.15
+        const per = assets.map((a) => {
+          try {
+            const r = computePlanEconomics({ flows: a.flows as any, exit_cap_rate: a.exit_cap_rate, exit_year: a.exit_year, discount_rate: a.discount_rate })
+            return {
+              asset_name: a.asset_name,
+              asset_id: a.asset_id ?? null,
+              fund: a.fund ?? null,
+              irr_excl_exit: r.irr_excl_exit,
+              irr_incremental: r.irr_incremental,
+              net_value_creation: r.waterfall.net_value_creation,
+              exit_value_uplift: r.waterfall.exit_value_uplift,
+              incremental_capex: -r.waterfall.incremental_capex,
+              above_hurdle: r.irr_incremental != null && r.irr_incremental >= hurdle,
+              waterfall: r.waterfall,
+            }
+          } catch (e: any) {
+            return { asset_name: a.asset_name, asset_id: a.asset_id ?? null, fund: a.fund ?? null, error: e.message }
+          }
+        })
+        const ok = per.filter((p: any) => !p.error)
+        const round = (n: number) => Math.round(n)
+        const total_value_creation = round(ok.reduce((s, p: any) => s + (p.net_value_creation ?? 0), 0))
+        const total_incremental_capex = round(ok.reduce((s, p: any) => s + (p.incremental_capex ?? 0), 0))
+        const assets_above_hurdle = ok.filter((p: any) => p.above_hurdle).length
+        // Fund-level rollup
+        const funds: Record<string, { value_creation: number; incremental_capex: number; assets: number; above_hurdle: number }> = {}
+        for (const p of ok as any[]) {
+          const k = p.fund ?? 'Unassigned'
+          funds[k] ??= { value_creation: 0, incremental_capex: 0, assets: 0, above_hurdle: 0 }
+          funds[k].value_creation += p.net_value_creation ?? 0
+          funds[k].incremental_capex += p.incremental_capex ?? 0
+          funds[k].assets += 1
+          funds[k].above_hurdle += p.above_hurdle ? 1 : 0
+        }
+        Object.values(funds).forEach((f) => { f.value_creation = round(f.value_creation); f.incremental_capex = round(f.incremental_capex) })
+        const result = {
+          provenance: { engine: 'compute_plan_economics', tool: 'compute_portfolio_economics', version: '1.0', computed: ok.length, errored: per.length - ok.length },
+          portfolio: { irr_hurdle: hurdle, assets_evaluated: per.length, assets_above_hurdle, total_value_creation, total_incremental_capex },
+          funds,
+          assets: per,
+        }
         return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] }
       } catch (e: any) {
         return { content: [{ type: 'text' as const, text: `Error: ${e.message}` }], isError: true }
