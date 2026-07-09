@@ -224,7 +224,13 @@ server.tool(
   // for each asset server-side, aggregates the portfolio rollups, and stamps engine provenance.
   // The agent never computes IRR/value itself — so hand-rolled/"Python replica" economics are
   // impossible — and one MCP call replaces ~39 per-asset round-trips (no requires_action churn).
-  const portfolioFlowYear = z.object({
+  // Factory (NOT a shared const): each call returns a fresh, fully independent zod
+  // object tree. Reusing a single shared schema object in more than one place makes
+  // the JSON-Schema serializer emit a `$ref`, which Anthropic's custom-tool
+  // input_schema REJECTS ("input_schema contains $ref, which is not supported") —
+  // that 500s every run loading this MCP. `flows` and `measures[].flows` therefore
+  // each get their own inlined copy via a separate makeFlowYear() call.
+  const makeFlowYear = () => z.object({
     year: z.number().int(),
     incremental_capex: z.number().optional(),
     owner_utility_savings: z.number().optional(),
@@ -248,13 +254,13 @@ server.tool(
         asset_id: z.string().optional().describe('Soapbox asset UUID (echoed back for joining).'),
         asset_name: z.string().describe('Asset name for the rollup rows.'),
         fund: z.string().optional().describe('Fund name for fund-level aggregation.'),
-        flows: z.array(portfolioFlowYear).min(1).optional().describe('LEGACY / economics-only: per-year owner-share flows for this asset. Prefer `measures` (below) — when `measures` is present it is the SOLE source and `flows` is ignored, so trajectory and headline economics cannot diverge.'),
+        flows: z.array(makeFlowYear()).min(1).optional().describe('LEGACY / economics-only: per-year owner-share flows for this asset. Prefer `measures` (below) — when `measures` is present it is the SOLE source and `flows` is ignored, so trajectory and headline economics cannot diverge.'),
         measures: z.array(z.object({
           install_year: z.number().int(),
           annual_tco2e_reduction: z.number().default(0),
           is_solar: z.boolean().optional().describe('Force-included in Scenario C (max solar).'),
           compliance_required: z.boolean().optional().describe('Force-included in ALL scenarios (regulatory).'),
-          flows: z.array(portfolioFlowYear).min(1).describe('This measure’s own per-year owner-share flows (same shape as compute_plan_economics).'),
+          flows: z.array(makeFlowYear()).min(1).describe('This measure’s own per-year owner-share flows (same shape as compute_plan_economics).'),
         })).optional().describe('Per-MEASURE flows. Enables the deterministic A/B/C/D emissions scenarios AND is summed to the asset-level economics (single source of truth). Screened per measure: A=irr_excl_exit≥hurdle, B=+irr_incremental≥hurdle, C=+all solar, D=+screen re-run at d_exit_year.'),
         exit_cap_rate: z.number().min(0.01).max(0.20),
         exit_year: z.number().int(),
