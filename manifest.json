@@ -1,0 +1,32 @@
+{
+  "$schema": "https://raw.githubusercontent.com/anthropics/mcpb/main/schemas/mcpb-manifest-v0.4.schema.json",
+  "manifest_version": "0.4",
+  "name": "soapbox-cashflow",
+  "display_name": "Cashflow & CapEx Modeling",
+  "version": "0.1.0",
+  "description": "Multi-year DCF and CapEx impact analysis for commercial real estate.",
+  "author": {
+    "name": "Soapbox",
+    "url": "https://soapbox.build"
+  },
+  "homepage": "https://soapbox.build/plugins",
+  "server": {
+    "type": "node",
+    "mcp_config": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "https://soapbox-cashflow-mcp-production.up.railway.app/mcp"
+      ]
+    }
+  },
+  "compatibility": {
+    "claude_desktop": ">=0.10.0",
+    "platforms": [
+      "darwin",
+      "win32",
+      "linux"
+    ]
+  }
+}
