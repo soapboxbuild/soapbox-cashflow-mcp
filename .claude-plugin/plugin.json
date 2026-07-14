@@ -1,0 +1,17 @@
+{
+  "name": "soapbox-cashflow",
+  "version": "0.1.0",
+  "description": "Multi-year DCF and CapEx impact analysis for commercial real estate.",
+  "author": {
+    "name": "Soapbox",
+    "url": "https://soapbox.build"
+  },
+  "homepage": "https://github.com/soapboxbuild/soapbox-cashflow-mcp",
+  "license": "Apache-2.0",
+  "mcpServers": {
+    "soapbox-cashflow": {
+      "type": "http",
+      "url": "https://soapbox-cashflow-mcp-production.up.railway.app/mcp"
+    }
+  }
+}
