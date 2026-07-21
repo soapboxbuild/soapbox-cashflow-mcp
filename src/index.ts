@@ -375,6 +375,66 @@ server.tool(
     }
   )
 
+  server.tool(
+    'run_npv_payback',
+    'Compute simple payback and NPV for a capital measure with a flat annual savings stream — generic, no real-estate DCF model required. Use this for straightforward capex/savings measures (e.g. an energy conservation measure) that do not need the full run_dcf/run_intervention_irr real-estate model.',
+    {
+      capital_cost: z.number().describe('Total capital cost ($)'),
+      annual_savings: z.number().describe('Flat annual cost savings ($/yr)'),
+      discount_rate: z.number().min(0).max(1).default(0.05).describe('Discount rate for NPV (default 5%)'),
+      years: z.number().int().min(1).max(50).default(15).describe('Analysis horizon in years (default 15)'),
+    },
+    async ({ capital_cost, annual_savings, discount_rate, years }) => {
+      const payback_yrs = annual_savings !== 0 ? capital_cost / annual_savings : null
+      // Closed-form annuity NPV for a flat annual savings stream: matches
+      // annual_savings * ((1-(1+r)^-n)/r) - capital_cost exactly.
+      const npv = annual_savings * ((1 - Math.pow(1 + discount_rate, -years)) / discount_rate) - capital_cost
+      return {
+        content: [{
+          type: 'text' as const,
+          text: JSON.stringify({
+            inputs: { capital_cost, annual_savings, discount_rate, years },
+            results: { payback_yrs, npv },
+          }, null, 2),
+        }],
+      }
+    }
+  )
+
+  server.tool(
+    'sum_register',
+    'Sum a register of measures/items by a grouping key (e.g. initiative_type) and overall. Use this for register roll-ups (category totals + grand total) instead of adding numbers by hand.',
+    {
+      items: z.array(z.record(z.string(), z.union([z.string(), z.number()]))).describe('Array of measure/item records, each a flat object of field -> value'),
+      group_by: z.string().describe('Field name to group by (e.g. "initiative_type")'),
+      sum_fields: z.array(z.string()).describe('Field names to sum within each group and overall (e.g. ["capital_cost", "annual_cost_savings"])'),
+    },
+    async ({ items, group_by, sum_fields }) => {
+      const groups: Record<string, Record<string, number>> = {}
+      const overall: Record<string, number> = {}
+      for (const field of sum_fields) overall[field] = 0
+      for (const item of items) {
+        const key = String(item[group_by] ?? 'unknown')
+        if (!groups[key]) {
+          groups[key] = {}
+          for (const field of sum_fields) groups[key][field] = 0
+        }
+        for (const field of sum_fields) {
+          const v = Number(item[field])
+          const n = Number.isFinite(v) ? v : 0
+          groups[key][field] += n
+          overall[field] += n
+        }
+      }
+      return {
+        content: [{
+          type: 'text' as const,
+          text: JSON.stringify({ groups, overall, count: items.length }, null, 2),
+        }],
+      }
+    }
+  )
+
   return server
 }
 
