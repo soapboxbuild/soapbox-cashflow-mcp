@@ -23,9 +23,14 @@
 //                             reconciles exactly to asset_value_impact − net capex)
 const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
 /** IRR via bisection over a wide bracket; robust for the sign-change streams decarb produces.
- *  Returns null if no sign change in [-0.95, 5.0] (e.g. all-positive or all-negative stream). */
-export function irr(cashflows, lo = -0.95, hi = 5.0, tol = 1e-10) {
-    const npv = (r) => cashflows.reduce((s, cf, t) => s + cf / (1 + r) ** t, 0);
+ *  Returns null if no sign change in [-0.95, 5.0] (e.g. all-positive or all-negative stream).
+ *  `periods` gives each cashflow's REAL elapsed time (e.g. year - baseYear) — defaults to
+ *  array index only when omitted. Real decarb plans skip years with no measure entirely, so the
+ *  cashflow array is sparse; discounting by array position instead of real elapsed years
+ *  silently compresses gaps and inflates the rate (see economics.test.ts's gap-year regression). */
+export function irr(cashflows, periods, lo = -0.95, hi = 5.0, tol = 1e-10) {
+    const t = periods ?? cashflows.map((_, i) => i);
+    const npv = (r) => cashflows.reduce((s, cf, i) => s + cf / (1 + r) ** t[i], 0);
     let flo = npv(lo);
     let fhi = npv(hi);
     if (flo === 0)
@@ -107,12 +112,13 @@ export function computePlanEconomics(input) {
     //   irr_incremental = the same stream WITH the terminal asset_value_impact folded into the exit
     //                     year — the value-inclusive return (operating + exit residual).
     const operatingStream = cashflow.map((c) => c.unlevered_incremental_cashflow);
+    const periods = cashflow.map((c) => c.year - cashflow[0].year);
     const exitIdx = cashflow.findIndex((c) => c.year === exitRow.year);
-    const rateExcl = irr(operatingStream);
+    const rateExcl = irr(operatingStream, periods);
     const irr_excl_exit = rateExcl == null ? null : Math.round(rateExcl * 1000) / 1000;
     const stream = [...operatingStream];
     stream[exitIdx] += terminal;
-    const rate = irr(stream);
+    const rate = irr(stream, periods);
     const irr_incremental = rate == null ? null : Math.round(rate * 1000) / 1000;
     // Capitalize the EXIT-YEAR (stabilized) run-rate — the value a buyer capitalizes at sale.
     // Using going-in (year-1) run-rate under-counts an ESCALATING stream, and made the waterfall
